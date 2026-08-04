@@ -1,27 +1,18 @@
 """
-CLIN-RAG · XAI Utilities – Attention Heatmap Overlay
+CLIN-RAG · XAI Utilities – Attention Heatmap Overlays
 =====================================================
-Generates interpretable heatmap overlays from the MedSigLIP vision
-encoder's internal patch-level activations.  The heatmaps expose *which
-spatial regions* of a chest X-ray the encoder attended to, providing
-clinically meaningful explainability.
+Provides two complementary XAI visualisation functions:
 
-Architecture
-------------
-1. Forward-pass the target image through the SigLIP vision tower with
-   ``output_hidden_states=True`` to capture the **last hidden state**.
-2. Compute per-patch activation magnitude (L2 norm across the hidden
-   dimension), producing a 1-D activation vector of length
-   ``num_patches = (image_size / patch_size) ** 2``.
-3. Reshape into the 2-D spatial patch grid and normalise to [0, 1].
-4. Upscale to the original image dimensions via **bilinear**
-   interpolation (no Gaussian blur is applied at any stage).
-5. Apply a JET colourmap and an alpha channel governed by the
-   caller-supplied ``threshold`` parameter: activations below the
-   threshold become fully transparent, revealing the original
-   radiograph underneath.
-6. Return the result as an RGBA ``PIL.Image`` ready for
-   ``Image.alpha_composite``.
+1. **Encoder-based** (``generate_attention_heatmap``):
+   Extracts patch-level activation magnitudes from the MedSigLIP vision
+   encoder.  Useful as a lightweight, pre-generation diagnostic.
+
+2. **Generator-based** (``process_generator_attention``):
+   Takes the aggregated 2-D spatial attention map produced by
+   ``ClinicalRAGSystem.generate_report`` (self-attention from
+   generated text tokens → prepended image tokens in MedGemma)
+   and converts it into a thresholded RGBA heatmap overlay.
+   This reflects the actual diagnostic reasoning of the generator.
 
 Critical Constraints
 --------------------
@@ -37,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Tuple
 
 import cv2
 import numpy as np
@@ -179,6 +171,111 @@ def generate_attention_heatmap(
         Path(image_path).name,
         grid_size,
         grid_size,
+        threshold,
+    )
+    return heatmap_pil
+
+
+# ---------------------------------------------------------------------------
+# Generator-based XAI (MedGemma self-attention → image tokens)
+# ---------------------------------------------------------------------------
+
+
+def process_generator_attention(
+    raw_attention_2d: np.ndarray,
+    original_image_size: Tuple[int, int],
+    threshold: float = 0.0,
+) -> Image.Image:
+    """Convert an aggregated 2-D attention grid into a thresholded RGBA heatmap.
+
+    This function takes the spatial attention map produced by
+    ``ClinicalRAGSystem._extract_image_attention`` (MedGemma
+    self-attention: generated tokens → prepended image tokens)
+    and renders it as an RGBA overlay ready for compositing.
+
+    Parameters
+    ----------
+    raw_attention_2d : np.ndarray
+        2-D float array of shape ``(grid_h, grid_w)`` produced by the
+        generator’s attention extraction pipeline.
+    original_image_size : tuple[int, int]
+        ``(width, height)`` of the original radiograph in pixels
+        (PIL convention).
+    threshold : float, optional
+        Activation cut-off in ``[0.0, 1.0]``.  Normalised values
+        **below** this threshold are rendered fully transparent
+        (alpha = 0).  ``0.0`` shows the full heatmap; ``1.0`` hides
+        it entirely.
+
+    Returns
+    -------
+    PIL.Image.Image
+        RGBA image at ``original_image_size`` ready for
+        ``Image.alpha_composite``.
+    """
+    orig_w, orig_h = original_image_size
+
+    # ------------------------------------------------------------------
+    # 1. Normalise to [0.0, 1.0]
+    # ------------------------------------------------------------------
+    grid = raw_attention_2d.astype(np.float64)
+    
+    # Statistical Sink Obliteration
+    p99 = np.percentile(grid, 99)
+    median_val = np.median(grid)
+    grid[grid > p99] = median_val
+
+    a_min, a_max = float(grid.min()), float(grid.max())
+
+    if a_max - a_min > 1e-8:
+        grid = (grid - a_min) / (a_max - a_min)
+    else:
+        grid = np.full_like(grid, 0.5)
+
+    grid = grid.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # 2. Upscale to original image dimensions (bilinear, NO blur)
+    # ------------------------------------------------------------------
+    heatmap_full: np.ndarray = cv2.resize(
+        grid,
+        (orig_w, orig_h),
+        interpolation=cv2.INTER_LINEAR,
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Apply JET colourmap → BGR → RGB
+    # ------------------------------------------------------------------
+    heatmap_uint8: np.ndarray = (heatmap_full * 255).astype(np.uint8)
+    heatmap_bgr: np.ndarray = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_rgb: np.ndarray = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+
+    # ------------------------------------------------------------------
+    # 4. Build the alpha channel with dynamic thresholding
+    # ------------------------------------------------------------------
+    BASE_ALPHA: int = 140  # ~55 % opacity for active regions
+
+    if threshold >= 1.0:
+        alpha = np.zeros_like(heatmap_full, dtype=np.uint8)
+    else:
+        alpha = np.where(
+            heatmap_full >= threshold,
+            np.uint8(BASE_ALPHA),
+            np.uint8(0),
+        ).astype(np.uint8)
+
+    # ------------------------------------------------------------------
+    # 5. Compose the RGBA image
+    # ------------------------------------------------------------------
+    rgba: np.ndarray = np.dstack([heatmap_rgb, alpha])
+    heatmap_pil: Image.Image = Image.fromarray(rgba, mode="RGBA")
+
+    logger.info(
+        "Generator XAI heatmap processed (grid=%d×%d, target=%d×%d, threshold=%.2f)",
+        raw_attention_2d.shape[1],
+        raw_attention_2d.shape[0],
+        orig_w,
+        orig_h,
         threshold,
     )
     return heatmap_pil

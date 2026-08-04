@@ -14,10 +14,11 @@ Author:  CLIN-RAG Team
 Created: 2026-08-03
 """
 
+import gc
 import logging
 import pickle
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import faiss
 import numpy as np
@@ -110,6 +111,7 @@ class ClinicalRAGSystem:
             token=self.hf_token,
             torch_dtype=dtype,
             device_map=self.device,
+            attn_implementation="eager",
         )
         self.generator.eval()
         logger.info("MedGemma generator loaded successfully.")
@@ -178,6 +180,129 @@ class ClinicalRAGSystem:
 
         return retrieved_cases
 
+    # ------------------------------------------------------------------
+    # Image-token detection helpers
+    # ------------------------------------------------------------------
+
+    def _detect_num_image_tokens(self, input_ids: torch.Tensor) -> int:
+        """Count how many image-placeholder tokens are in the input sequence.
+
+        MedGemma / Gemma 3 prepends projected SigLIP patch embeddings as
+        contiguous placeholder tokens.  This method finds their count by
+        checking the model config and tokenizer for the image token ID.
+
+        Returns 0 when detection fails (graceful degradation for XAI).
+        """
+        # Robust multi-fallback chain for the image token ID
+        image_token_id: Optional[int] = getattr(
+            self.generator.config, "image_token_index", None
+        )
+        if image_token_id is None:
+            image_token_id = getattr(self.processor, "image_token_id", None)
+        if image_token_id is None:
+            try:
+                image_token_id = self.processor.tokenizer.convert_tokens_to_ids(
+                    "<image_soft_token>"
+                )
+                if image_token_id == self.processor.tokenizer.unk_token_id:
+                    image_token_id = None
+            except Exception:
+                image_token_id = None
+
+        if image_token_id is None:
+            logger.warning(
+                "Could not determine image token ID — XAI attention map "
+                "will not be available."
+            )
+            return 0
+
+        count = int((input_ids[0] == image_token_id).sum().item())
+        logger.info(
+            "Detected %d image tokens (token_id=%d) in input sequence.",
+            count,
+            image_token_id,
+        )
+        return count
+
+    # ------------------------------------------------------------------
+    # Attention extraction (VRAM-safe)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_image_attention(
+        attentions_tuple: tuple,
+        num_image_tokens: int,
+    ) -> Optional[np.ndarray]:
+        """Aggregate generator self-attention from generated tokens → image tokens.
+
+        Parameters
+        ----------
+        attentions_tuple
+            ``outputs.attentions`` from ``generate(output_attentions=True,
+            return_dict_in_generate=True)``.  Structure:
+            ``tuple[step]( tuple[layer]( Tensor(B, H, Q, KV) ) )``
+            With KV-cache, decode steps have ``Q = 1``.
+        num_image_tokens : int
+            Number of image placeholder positions at the start of the
+            input sequence.
+
+        Returns
+        -------
+        np.ndarray or None
+            2-D float32 array of shape ``(grid, grid)`` representing
+            spatial attention, or *None* on failure.
+        """
+        if not attentions_tuple:
+            return None
+
+        # Collect attention grids for each step
+        attention_grids = []
+
+        for step_idx, step_attns in enumerate(attentions_tuple):
+            # Select the last 4 layers
+            selected_layers = list(step_attns[-4:])
+            
+            # Filter valid layers that contain all image tokens
+            valid_layers = [L for L in selected_layers if L.shape[-1] >= num_image_tokens]
+            if not valid_layers:
+                continue
+
+            # Average the valid layers. L shape: (batch, heads, q_len, kv_len)
+            avg_attn = torch.stack(valid_layers).mean(dim=0)
+            
+            if step_idx == 0:
+                # Prefill step: use the last query row
+                token_attn = avg_attn[0, :, -1, :num_image_tokens]
+            else:
+                # Decode step: use the only query row
+                token_attn = avg_attn[0, :, 0, :num_image_tokens]
+
+            # Aggregate heads and move to CPU
+            step_aggregated = token_attn.float().mean(dim=0).cpu().numpy()
+            
+            # Reshape to a 2-D spatial grid
+            grid_size = int(np.sqrt(num_image_tokens))
+            if grid_size * grid_size == num_image_tokens:
+                grid = step_aggregated.astype(np.float32).reshape(grid_size, grid_size)
+            else:
+                grid_size = int(np.ceil(np.sqrt(num_image_tokens)))
+                padded = np.zeros(grid_size * grid_size, dtype=np.float32)
+                padded[:num_image_tokens] = step_aggregated.astype(np.float32)
+                grid = padded.reshape(grid_size, grid_size)
+                
+            attention_grids.append(grid)
+
+        if not attention_grids:
+            logger.warning("No decode-step attention contributions found.")
+            return None
+
+        # Return 3D array: (num_steps, grid_h, grid_w)
+        return np.stack(attention_grids)
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
+
     def generate_report(
         self, target_image_path: str | Path, retrieved_cases: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -188,12 +313,18 @@ class ClinicalRAGSystem:
         target_image_path : str | Path
             Path to the target chest X-ray image.
         retrieved_cases : List[Dict[str, Any]]
-            The context dictionary list returned by `retrieve_similar_cases`.
+            The context dictionary list returned by ``retrieve_similar_cases``.
 
         Returns
         -------
         Dict[str, Any]
-            Dictionary containing the retrieved cases and the generated Markdown report.
+            Dictionary containing:
+            - ``retrieved_cases`` – the input cases (pass-through).
+            - ``generated_report`` – the Markdown-formatted report text.
+            - ``attention_map_2d`` – a 2-D ``np.ndarray`` (or *None*) of
+              aggregated self-attention from generated tokens to image
+              tokens, suitable for XAI heatmap visualisation.
+            - ``num_image_tokens`` – count of image placeholder tokens.
         """
         logger.info("Constructing prompt and generating report...")
 
@@ -281,26 +412,140 @@ class ClinicalRAGSystem:
             if self.device.type == "cuda":
                 model_inputs["pixel_values"] = model_inputs["pixel_values"].to(torch.bfloat16)
 
-        # Generate Output
+        # -----------------------------------------------------------------
+        # Detect image tokens BEFORE generation (needed for XAI)
+        # -----------------------------------------------------------------
+        num_image_tokens: int = self._detect_num_image_tokens(
+            model_inputs["input_ids"]
+        )
+
+        # -----------------------------------------------------------------
+        # Generate with attention capture
+        # -----------------------------------------------------------------
+        # output_attentions=True forces eager (non-SDPA) attention so that
+        # per-head weight matrices are returned.  With KV-cache each decode
+        # step stores only a (B, H, 1, KV) tensor, keeping VRAM overhead
+        # manageable (~1-2 GB for Gemma-3 4B with 8 heads, 34 layers).
+        logger.info("Running MedGemma generate with attention capture...")
+
         with torch.no_grad():
-            output_ids = self.generator.generate(
+            outputs = self.generator.generate(
                 **model_inputs,
                 max_new_tokens=512,
                 do_sample=False,  # Greedy decoding for clinical factual consistency
+                output_attentions=True,
+                return_dict_in_generate=True,
             )
 
-        # Decode output, skipping the prompt tokens
+        # -----------------------------------------------------------------
+        # Extract image attention (CPU-safe, step-by-step)
+        # -----------------------------------------------------------------
+        attention_map_3d: Optional[np.ndarray] = None
+
+        if num_image_tokens > 0 and outputs.attentions is not None:
+            attention_map_3d = self._extract_image_attention(
+                outputs.attentions, num_image_tokens
+            )
+
+        # -----------------------------------------------------------------
+        # Decode the generated report and Individual Tokens
+        # -----------------------------------------------------------------
         input_len = model_inputs["input_ids"].shape[1]
+        output_ids = outputs.sequences
+        generated_token_ids = output_ids[0][input_len:]
+        
+        # Cleanly decode tokens for UI presentation
+        generated_tokens = []
+        for tid in generated_token_ids:
+            # Decode single token ID
+            decoded_str = self.processor.decode([tid], skip_special_tokens=True)
+            # Remove SentencePiece underscore meta characters if present
+            decoded_str = decoded_str.replace(' ', ' ')
+            generated_tokens.append(decoded_str)
+
         generated_text = self.processor.decode(
-            output_ids[0][input_len:], skip_special_tokens=True
+            generated_token_ids, skip_special_tokens=True
         ).strip()
 
+        # Aggressively free the massive attention tensors
+        del outputs
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         logger.info("Report generation completed successfully.")
+
+        # --- LLM Zero-Shot Entity Extraction ---
+        clinical_entities = self._extract_clinical_entities(target_image_path, generated_text)
+        matched_indices = self._match_entities_to_tokens(clinical_entities, generated_tokens)
+        logger.info(f"Extracted clinical entities: {clinical_entities}")
 
         return {
             "retrieved_cases": retrieved_cases,
             "generated_report": generated_text,
+            "generated_tokens": generated_tokens,
+            "attention_map_3d": attention_map_3d,
+            "num_image_tokens": num_image_tokens,
+            "clinical_entities": clinical_entities,
+            "clinical_indices": matched_indices,
         }
+
+    def _extract_clinical_entities(self, target_image_path: str, report_text: str) -> List[str]:
+        logger.info("Running LLM zero-shot entity extraction...")
+        prompt_text = (
+            "Extract all key anatomical structures and pathological findings from the following text. "
+            "Return ONLY a comma-separated list of the base terms without adjectives (e.g., 'lungs', 'opacity', 'pleural effusion').\n"
+            f"Text: {report_text}\n"
+            "Terms:"
+        )
+        
+        image = Image.open(target_image_path).convert("RGB")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+        
+        model_inputs = self.processor(
+            text=inputs, images=image, return_tensors="pt"
+        ).to(self.device)
+        if self.device.type == "cuda":
+            model_inputs["pixel_values"] = model_inputs["pixel_values"].to(torch.bfloat16)
+            
+        with torch.no_grad():
+            outputs = self.generator.generate(
+                **model_inputs,
+                max_new_tokens=64,
+                do_sample=False,
+            )
+            
+        input_len = model_inputs["input_ids"].shape[1]
+        generated_token_ids = outputs[0][input_len:]
+        extracted_text = self.processor.decode(generated_token_ids, skip_special_tokens=True).strip()
+        
+        # Parse the comma-separated string
+        entities = [e.strip().lower() for e in extracted_text.split(',') if e.strip()]
+        return entities
+
+    def _match_entities_to_tokens(self, entities: List[str], generated_tokens: List[str]) -> List[int]:
+        matched_indices = set()
+        for i, token in enumerate(generated_tokens):
+            clean_token = token.strip().lower()
+            if not clean_token or not clean_token.isalpha() or len(clean_token) < 2:
+                continue
+                
+            for entity in entities:
+                if clean_token in entity or entity in clean_token:
+                    matched_indices.add(i)
+                    break
+        return sorted(list(matched_indices))
 
 
 # ---------------------------------------------------------------------------
