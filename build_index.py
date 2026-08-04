@@ -110,6 +110,18 @@ def load_projection_records(csv_path: Path = PROJECTIONS_CSV) -> pd.DataFrame:
     # Ensure the uid column is typed as a native Python int.
     df["uid"] = df["uid"].astype(int)
 
+    # Exclude test cases if mapping exists
+    test_meta_path = PROJECT_ROOT / "data" / "test_samples" / "test_metadata.csv"
+    if test_meta_path.exists():
+        test_df = pd.read_csv(test_meta_path)
+        test_uids = set(test_df["uid"].astype(int))
+        initial_count = len(df)
+        df = df[~df["uid"].isin(test_uids)].copy()
+        logger.info(
+            "Excluded %d projection records matching test samples (UID mapping).",
+            initial_count - len(df),
+        )
+
     logger.info(
         "Loaded %d projection records (%d unique patients) from %s",
         len(df),

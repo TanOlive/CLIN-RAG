@@ -114,14 +114,14 @@ def main() -> None:
 
         with target_col:
             st.subheader("Target Image")
-            st.image(target_image, use_container_width=True, caption="Uploaded Radiograph")
+            st.image(target_image, width='stretch', caption="Uploaded Radiograph")
 
         st.markdown("---")
         
         # 5. Execution Logic
         col_btn, _ = st.columns([1, 4])
         with col_btn:
-            generate_clicked = st.button("Generate Clinical Report", type="primary", use_container_width=True)
+            generate_clicked = st.button("Generate Clinical Report", type="primary", width='stretch')
 
         if generate_clicked:
             # We must write the uploaded file temporarily to disk because 
@@ -177,7 +177,7 @@ def main() -> None:
                             with ev_col_img:
                                 if ref_image_path.exists():
                                     ref_img = Image.open(ref_image_path)
-                                    st.image(ref_img, use_container_width=True, caption=case["filename"])
+                                    st.image(ref_img, width='stretch', caption=case["filename"])
                                 else:
                                     st.error("Reference image file missing from dataset archive.")
                 else:
