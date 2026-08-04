@@ -21,6 +21,7 @@ import streamlit as st
 from PIL import Image
 
 from rag_pipeline import ClinicalRAGSystem
+from xai_utils import generate_attention_heatmap
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -78,6 +79,17 @@ def main() -> None:
         help="The number of structurally similar historical cases to retrieve as context for the generator."
     )
 
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔬 Explainability (XAI)")
+    heatmap_threshold: float = st.sidebar.slider(
+        "XAI Heatmap Focus",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.0,
+        step=0.05,
+        help="0.0 shows all activations. 1.0 hides the heatmap entirely. Use this to isolate high-attention (red) areas.",
+    )
+
     # 3. Initialize Pipeline
     try:
         rag_sys: ClinicalRAGSystem = load_system()
@@ -112,9 +124,58 @@ def main() -> None:
             st.error(f"Failed to read image file: {e}")
             st.stop()
 
+        # ---------------------------------------------------------------
+        # Persist uploaded file to disk so the XAI util can read it.
+        # We reuse the same temp path across slider re-runs.
+        # ---------------------------------------------------------------
+        xai_tmp_path = TEMP_UPLOAD_DIR / f"xai_{uploaded_file.name}"
+        if not xai_tmp_path.exists():
+            img_for_disk = Image.open(uploaded_file).convert("RGB")
+            img_for_disk.save(xai_tmp_path)
+
         with target_col:
             st.subheader("Target Image")
             st.image(target_image, width='stretch', caption="Uploaded Radiograph")
+
+        # ---------------------------------------------------------------
+        # XAI Heatmap Overlay (reacts to slider without rerunning RAG)
+        # ---------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("🔬 XAI Attention Heatmap")
+        st.caption(
+            "Visualises MedSigLIP patch activations.  "
+            "Use the sidebar slider to isolate high-attention (red) regions."
+        )
+
+        try:
+            heatmap_rgba: Image.Image = generate_attention_heatmap(
+                image_path=str(xai_tmp_path),
+                encoder_model=rag_sys.encoder,
+                threshold=heatmap_threshold,
+            )
+
+            # Composite: convert target to RGBA, paste heatmap on top
+            base: Image.Image = target_image.convert("RGBA")
+            # Ensure both layers share the same dimensions
+            if heatmap_rgba.size != base.size:
+                heatmap_rgba = heatmap_rgba.resize(base.size, Image.BILINEAR)
+            composite: Image.Image = Image.alpha_composite(base, heatmap_rgba)
+
+            xai_col_overlay, xai_col_orig = st.columns(2, gap="large")
+            with xai_col_overlay:
+                st.image(
+                    composite,
+                    width='stretch',
+                    caption=f"Attention Overlay  (threshold = {heatmap_threshold:.2f})",
+                )
+            with xai_col_orig:
+                st.image(
+                    target_image,
+                    width='stretch',
+                    caption="Original Radiograph (reference)",
+                )
+        except Exception as e:
+            st.warning(f"XAI heatmap generation failed: {e}")
 
         st.markdown("---")
         
