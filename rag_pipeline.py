@@ -103,14 +103,19 @@ class ClinicalRAGSystem:
         
         dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         
+        # 6. Load the Generator Model (MedGemma)
+        logger.info("Loading generator model 'google/medgemma-1.5-4b-it' ...")
+        
+        # We explicitly set attn_implementation="eager" because the PyTorch SDPA 'math' 
+        # fallback is extremely slow on some Windows setups during autoregressive generation.
         self.processor = AutoProcessor.from_pretrained(
             model_id, token=self.hf_token
         )
         self.generator = AutoModelForImageTextToText.from_pretrained(
-            model_id,
-            token=self.hf_token,
-            torch_dtype=dtype,
+            "google/medgemma-1.5-4b-it",
             device_map=self.device,
+            torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
+            token=self.hf_token,
             attn_implementation="eager",
         )
         self.generator.eval()
@@ -224,80 +229,7 @@ class ClinicalRAGSystem:
         )
         return count
 
-    # ------------------------------------------------------------------
-    # Attention extraction (VRAM-safe)
-    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _extract_image_attention(
-        attentions_tuple: tuple,
-        num_image_tokens: int,
-    ) -> Optional[np.ndarray]:
-        """Aggregate generator self-attention from generated tokens → image tokens.
-
-        Parameters
-        ----------
-        attentions_tuple
-            ``outputs.attentions`` from ``generate(output_attentions=True,
-            return_dict_in_generate=True)``.  Structure:
-            ``tuple[step]( tuple[layer]( Tensor(B, H, Q, KV) ) )``
-            With KV-cache, decode steps have ``Q = 1``.
-        num_image_tokens : int
-            Number of image placeholder positions at the start of the
-            input sequence.
-
-        Returns
-        -------
-        np.ndarray or None
-            2-D float32 array of shape ``(grid, grid)`` representing
-            spatial attention, or *None* on failure.
-        """
-        if not attentions_tuple:
-            return None
-
-        # Collect attention grids for each step
-        attention_grids = []
-
-        for step_idx, step_attns in enumerate(attentions_tuple):
-            # Select the last 4 layers
-            selected_layers = list(step_attns[-4:])
-            
-            # Filter valid layers that contain all image tokens
-            valid_layers = [L for L in selected_layers if L.shape[-1] >= num_image_tokens]
-            if not valid_layers:
-                continue
-
-            # Average the valid layers. L shape: (batch, heads, q_len, kv_len)
-            avg_attn = torch.stack(valid_layers).mean(dim=0)
-            
-            if step_idx == 0:
-                # Prefill step: use the last query row
-                token_attn = avg_attn[0, :, -1, :num_image_tokens]
-            else:
-                # Decode step: use the only query row
-                token_attn = avg_attn[0, :, 0, :num_image_tokens]
-
-            # Aggregate heads and move to CPU
-            step_aggregated = token_attn.float().mean(dim=0).cpu().numpy()
-            
-            # Reshape to a 2-D spatial grid
-            grid_size = int(np.sqrt(num_image_tokens))
-            if grid_size * grid_size == num_image_tokens:
-                grid = step_aggregated.astype(np.float32).reshape(grid_size, grid_size)
-            else:
-                grid_size = int(np.ceil(np.sqrt(num_image_tokens)))
-                padded = np.zeros(grid_size * grid_size, dtype=np.float32)
-                padded[:num_image_tokens] = step_aggregated.astype(np.float32)
-                grid = padded.reshape(grid_size, grid_size)
-                
-            attention_grids.append(grid)
-
-        if not attention_grids:
-            logger.warning("No decode-step attention contributions found.")
-            return None
-
-        # Return 3D array: (num_steps, grid_h, grid_w)
-        return np.stack(attention_grids)
 
     # ------------------------------------------------------------------
     # Report generation
@@ -420,31 +352,32 @@ class ClinicalRAGSystem:
         )
 
         # -----------------------------------------------------------------
-        # Generate with attention capture
+        # Extract Vision Tower Self-Attention
         # -----------------------------------------------------------------
-        # output_attentions=True forces eager (non-SDPA) attention so that
-        # per-head weight matrices are returned.  With KV-cache each decode
-        # step stores only a (B, H, 1, KV) tensor, keeping VRAM overhead
-        # manageable (~1-2 GB for Gemma-3 4B with 8 heads, 34 layers).
-        logger.info("Running MedGemma generate with attention capture...")
+        vision_attention: Optional[np.ndarray] = None
+        if "pixel_values" in model_inputs:
+            logger.info("Extracting Vision Tower self-attention...")
+            with torch.no_grad():
+                vision_outputs = self.generator.model.vision_tower(
+                    model_inputs["pixel_values"],
+                    output_attentions=True,
+                )
+                if vision_outputs.attentions is not None:
+                    # Extract the final layer's attention matrix
+                    # Shape: (batch_size, num_heads, seq_len, seq_len)
+                    vision_attention = vision_outputs.attentions[-1].to(torch.float32).cpu().numpy()
+
+        # -----------------------------------------------------------------
+        # Generate Report
+        # -----------------------------------------------------------------
+        logger.info("Running MedGemma generate...")
 
         with torch.no_grad():
             outputs = self.generator.generate(
                 **model_inputs,
                 max_new_tokens=512,
                 do_sample=False,  # Greedy decoding for clinical factual consistency
-                output_attentions=True,
                 return_dict_in_generate=True,
-            )
-
-        # -----------------------------------------------------------------
-        # Extract image attention (CPU-safe, step-by-step)
-        # -----------------------------------------------------------------
-        attention_map_3d: Optional[np.ndarray] = None
-
-        if num_image_tokens > 0 and outputs.attentions is not None:
-            attention_map_3d = self._extract_image_attention(
-                outputs.attentions, num_image_tokens
             )
 
         # -----------------------------------------------------------------
@@ -475,77 +408,16 @@ class ClinicalRAGSystem:
 
         logger.info("Report generation completed successfully.")
 
-        # --- LLM Zero-Shot Entity Extraction ---
-        clinical_entities = self._extract_clinical_entities(target_image_path, generated_text)
-        matched_indices = self._match_entities_to_tokens(clinical_entities, generated_tokens)
-        logger.info(f"Extracted clinical entities: {clinical_entities}")
-
+        # -----------------------------------------------------------------
+        # Return Results
+        # -----------------------------------------------------------------
         return {
             "retrieved_cases": retrieved_cases,
             "generated_report": generated_text,
             "generated_tokens": generated_tokens,
-            "attention_map_3d": attention_map_3d,
+            "vision_attention": vision_attention,
             "num_image_tokens": num_image_tokens,
-            "clinical_entities": clinical_entities,
-            "clinical_indices": matched_indices,
         }
-
-    def _extract_clinical_entities(self, target_image_path: str, report_text: str) -> List[str]:
-        logger.info("Running LLM zero-shot entity extraction...")
-        prompt_text = (
-            "Extract all key anatomical structures and pathological findings from the following text. "
-            "Return ONLY a comma-separated list of the base terms without adjectives (e.g., 'lungs', 'opacity', 'pleural effusion').\n"
-            f"Text: {report_text}\n"
-            "Terms:"
-        )
-        
-        image = Image.open(target_image_path).convert("RGB")
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ]
-        inputs = self.processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
-        )
-        
-        model_inputs = self.processor(
-            text=inputs, images=image, return_tensors="pt"
-        ).to(self.device)
-        if self.device.type == "cuda":
-            model_inputs["pixel_values"] = model_inputs["pixel_values"].to(torch.bfloat16)
-            
-        with torch.no_grad():
-            outputs = self.generator.generate(
-                **model_inputs,
-                max_new_tokens=64,
-                do_sample=False,
-            )
-            
-        input_len = model_inputs["input_ids"].shape[1]
-        generated_token_ids = outputs[0][input_len:]
-        extracted_text = self.processor.decode(generated_token_ids, skip_special_tokens=True).strip()
-        
-        # Parse the comma-separated string
-        entities = [e.strip().lower() for e in extracted_text.split(',') if e.strip()]
-        return entities
-
-    def _match_entities_to_tokens(self, entities: List[str], generated_tokens: List[str]) -> List[int]:
-        matched_indices = set()
-        for i, token in enumerate(generated_tokens):
-            clean_token = token.strip().lower()
-            if not clean_token or not clean_token.isalpha() or len(clean_token) < 2:
-                continue
-                
-            for entity in entities:
-                if clean_token in entity or entity in clean_token:
-                    matched_indices.add(i)
-                    break
-        return sorted(list(matched_indices))
 
 
 # ---------------------------------------------------------------------------

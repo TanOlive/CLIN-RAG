@@ -26,7 +26,7 @@ import streamlit as st
 from PIL import Image
 
 from rag_pipeline import ClinicalRAGSystem
-from xai_utils import process_generator_attention
+from xai_utils import process_vision_attention
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -70,8 +70,7 @@ def main() -> None:
     # 2. Sidebar Settings
     st.sidebar.markdown(
         """
-        ## ⚙️ CLIN-RAG Settings
-        Configure the retrieval parameters for the RAG pipeline.
+        ## ⚙️ Settings
         """
     )
     st.sidebar.markdown("---")
@@ -85,12 +84,12 @@ def main() -> None:
     )
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔬 Explainability (XAI)")
+    st.sidebar.markdown("### Explainability (XAI)")
     heatmap_threshold: float = st.sidebar.slider(
         "XAI Heatmap Focus",
         min_value=0.0,
         max_value=1.0,
-        value=0.0,
+        value=0.50,
         step=0.05,
         help="0.0 shows all activations. 1.0 hides the heatmap entirely. Use this to isolate high-attention (red) areas.",
     )
@@ -151,7 +150,7 @@ def main() -> None:
         # 5. Execution Logic
         col_btn, _ = st.columns([1, 4])
         with col_btn:
-            generate_clicked = st.button("Generate Clinical Report", type="primary", width='stretch')
+            generate_clicked = st.button("Generate Clinical Report", type="primary")
 
         if generate_clicked:
             # We must write the uploaded file temporarily to disk because 
@@ -173,9 +172,7 @@ def main() -> None:
                 st.session_state["generated_report"] = result["generated_report"]
                 st.session_state["generated_tokens"] = result.get("generated_tokens", [])
                 st.session_state["retrieved_cases"] = retrieved_cases
-                st.session_state["xai_attention_map_3d"] = result.get("attention_map_3d")
-                st.session_state["clinical_entities"] = result.get("clinical_entities", [])
-                st.session_state["clinical_indices"] = result.get("clinical_indices", [])
+                st.session_state["xai_vision_attention"] = result.get("vision_attention")
 
             except Exception as e:
                 st.error(f"An error occurred during pipeline execution: {e}")
@@ -191,31 +188,20 @@ def main() -> None:
             st.subheader("Target Image & XAI Heatmap")
             
             # If we have generated the report and have a heatmap, display it here
-            raw_attn_3d = st.session_state.get("xai_attention_map_3d")
-            tokens = st.session_state.get("generated_tokens", [])
+            vision_attn = st.session_state.get("xai_vision_attention")
 
-            if "generated_report" in st.session_state and raw_attn_3d is not None and len(tokens) > 0:
-                clinical_indices = st.session_state.get("clinical_indices", [])
-                
+            if "generated_report" in st.session_state and vision_attn is not None:
                 try:
-                    if not clinical_indices:
-                        st.warning("No clinical tokens found to generate XAI.")
-                        st.image(target_image, width='stretch', caption="Uploaded Radiograph")
-                    else:
-                        # 2. Targeted Aggregation
-                        matched_slices = raw_attn_3d[clinical_indices]
-                        raw_attn_2d = np.mean(matched_slices, axis=0)
-
-                        heatmap_rgba: Image.Image = process_generator_attention(
-                            raw_attention_2d=raw_attn_2d,
-                            original_image_size=target_image.size,
-                            threshold=heatmap_threshold,
-                        )
-                        base: Image.Image = target_image.convert("RGBA")
-                        if heatmap_rgba.size != base.size:
-                            heatmap_rgba = heatmap_rgba.resize(base.size, Image.BILINEAR)
-                        composite: Image.Image = Image.alpha_composite(base, heatmap_rgba)
-                        st.image(composite, width='stretch', caption=f"Semantic Generator Attention (threshold = {heatmap_threshold:.2f})")
+                    heatmap_rgba: Image.Image = process_vision_attention(
+                        vision_attention=vision_attn,
+                        original_image=target_image,
+                        threshold=heatmap_threshold,
+                    )
+                    base: Image.Image = target_image.convert("RGBA")
+                    if heatmap_rgba.size != base.size:
+                        heatmap_rgba = heatmap_rgba.resize(base.size, Image.BILINEAR)
+                    composite: Image.Image = Image.alpha_composite(base, heatmap_rgba)
+                    st.image(composite, width='stretch', caption=f"Vision Encoder Attention Saliency (threshold = {heatmap_threshold:.2f})")
                 except Exception as e:
                     st.warning(f"XAI heatmap rendering failed: {e}")
                     st.image(target_image, width='stretch', caption="Uploaded Radiograph")
@@ -233,15 +219,6 @@ def main() -> None:
             
             with st.container(border=True):
                 st.markdown(st.session_state["generated_report"])
-
-            tokens = st.session_state.get("generated_tokens", [])
-            if tokens:
-                st.markdown("### Semantic Attention XAI")
-                st.markdown("The global XAI heatmap above uses a zero-shot LLM pass to intelligently extract anatomical and pathological entities, automatically filtering out non-clinical tokens and mathematically eradicating attention sinks to reveal true semantic grounding.")
-                
-                clinical_entities = st.session_state.get("clinical_entities", [])
-                if clinical_entities:
-                    st.markdown("**Tokens used for heatmap:** `" + "`, `".join(clinical_entities) + "`")
 
             st.markdown("---")
 

@@ -181,61 +181,73 @@ def generate_attention_heatmap(
 # ---------------------------------------------------------------------------
 
 
-def process_generator_attention(
-    raw_attention_2d: np.ndarray,
-    original_image_size: Tuple[int, int],
+def process_vision_attention(
+    vision_attention: np.ndarray,
+    original_image: Image.Image,
     threshold: float = 0.0,
 ) -> Image.Image:
-    """Convert an aggregated 2-D attention grid into a thresholded RGBA heatmap.
-
-    This function takes the spatial attention map produced by
-    ``ClinicalRAGSystem._extract_image_attention`` (MedGemma
-    self-attention: generated tokens → prepended image tokens)
-    and renders it as an RGBA overlay ready for compositing.
+    """Convert a Vision Encoder attention matrix into a thresholded RGBA heatmap.
 
     Parameters
     ----------
-    raw_attention_2d : np.ndarray
-        2-D float array of shape ``(grid_h, grid_w)`` produced by the
-        generator’s attention extraction pipeline.
-    original_image_size : tuple[int, int]
-        ``(width, height)`` of the original radiograph in pixels
-        (PIL convention).
+    vision_attention : np.ndarray
+        4-D float array of shape ``(batch, num_heads, seq_len, seq_len)`` produced by the
+        Vision Tower's self-attention.
+    original_image : Image.Image
+        The original PIL radiograph.
     threshold : float, optional
-        Activation cut-off in ``[0.0, 1.0]``.  Normalised values
-        **below** this threshold are rendered fully transparent
-        (alpha = 0).  ``0.0`` shows the full heatmap; ``1.0`` hides
-        it entirely.
+        Activation cut-off in ``[0.0, 1.0]``.
 
     Returns
     -------
     PIL.Image.Image
-        RGBA image at ``original_image_size`` ready for
+        RGBA image at ``original_image.size`` ready for
         ``Image.alpha_composite``.
     """
-    orig_w, orig_h = original_image_size
+    orig_w, orig_h = original_image.size
 
-    # ------------------------------------------------------------------
-    # 1. Normalise to [0.0, 1.0]
-    # ------------------------------------------------------------------
-    grid = raw_attention_2d.astype(np.float64)
-    
-    # Statistical Sink Obliteration
-    p99 = np.percentile(grid, 99)
-    median_val = np.median(grid)
-    grid[grid > p99] = median_val
+    # Average across attention heads
+    # vision_attention is (1, heads, seq, seq)
+    mean_heads = np.mean(vision_attention[0], axis=0) # shape: (seq, seq)
 
-    a_min, a_max = float(grid.min()), float(grid.max())
+    # SigLIP (used in Gemma) lacks a CLS token and uses global pooling.
+    # We calculate the mean attention of all spatial patches to all other spatial patches.
+    # This represents how much each patch is attended to overall.
+    spatial_relevance = np.mean(mean_heads, axis=0) # shape: (seq,)
 
-    if a_max - a_min > 1e-8:
-        grid = (grid - a_min) / (a_max - a_min)
+    # Reshape 1D to 2D
+    seq_len = spatial_relevance.shape[0]
+    grid_size = int(np.sqrt(seq_len))
+    if grid_size * grid_size == seq_len:
+        grid = spatial_relevance.reshape((grid_size, grid_size)).astype(np.float32)
     else:
-        grid = np.full_like(grid, 0.5)
-
-    grid = grid.astype(np.float32)
+        # Fallback if somehow not a perfect square
+        logger.warning(f"Vision attention seq_len {seq_len} is not a perfect square.")
+        grid = np.zeros((grid_size, grid_size), dtype=np.float32)
 
     # ------------------------------------------------------------------
-    # 2. Upscale to original image dimensions (bilinear, NO blur)
+    # 2. Top-Left Sink Masking (ViT Artifact Mitigation)
+    # ------------------------------------------------------------------
+    # Force the top-left patch (index 0,0) to zero, as it frequently 
+    # acts as a pseudo-CLS attention sink across ViT layers.
+    if grid.shape[0] > 0 and grid.shape[1] > 0:
+        grid[0, 0] = 0.0
+
+    # ------------------------------------------------------------------
+    # 3. Robust Percentile Clipping
+    # ------------------------------------------------------------------
+    # Calculate the 98th percentile to ignore extreme isolated spikes
+    if np.any(grid > 0):
+        v_max = np.percentile(grid, 98)
+        # Clip the values so the extreme artifact is flattened to v_max
+        clipped_attention = np.clip(grid, 0, v_max)
+        # Normalize based on the clipped maximum to stretch the anatomical features
+        grid = clipped_attention / (v_max + 1e-8)
+    else:
+        grid = np.zeros_like(grid)
+
+    # ------------------------------------------------------------------
+    # 4. Upscale to original image dimensions
     # ------------------------------------------------------------------
     heatmap_full: np.ndarray = cv2.resize(
         grid,
@@ -244,14 +256,24 @@ def process_generator_attention(
     )
 
     # ------------------------------------------------------------------
-    # 3. Apply JET colourmap → BGR → RGB
+    # 5. Apply Spatial Smoothing
+    # ------------------------------------------------------------------
+    # Calculate a dynamic kernel size (approx 7.5% of width)
+    k_size = max(3, int(orig_w * 0.075))
+    if k_size % 2 == 0:
+        k_size += 1
+        
+    heatmap_full = cv2.GaussianBlur(heatmap_full, (k_size, k_size), 0)
+
+    # ------------------------------------------------------------------
+    # 6. Apply JET colourmap → BGR → RGB
     # ------------------------------------------------------------------
     heatmap_uint8: np.ndarray = (heatmap_full * 255).astype(np.uint8)
     heatmap_bgr: np.ndarray = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
     heatmap_rgb: np.ndarray = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
 
     # ------------------------------------------------------------------
-    # 4. Build the alpha channel with dynamic thresholding
+    # 7. Build the alpha channel with dynamic thresholding
     # ------------------------------------------------------------------
     BASE_ALPHA: int = 140  # ~55 % opacity for active regions
 
@@ -265,15 +287,15 @@ def process_generator_attention(
         ).astype(np.uint8)
 
     # ------------------------------------------------------------------
-    # 5. Compose the RGBA image
+    # 8. Compose the RGBA image
     # ------------------------------------------------------------------
     rgba: np.ndarray = np.dstack([heatmap_rgb, alpha])
     heatmap_pil: Image.Image = Image.fromarray(rgba, mode="RGBA")
 
     logger.info(
         "Generator XAI heatmap processed (grid=%d×%d, target=%d×%d, threshold=%.2f)",
-        raw_attention_2d.shape[1],
-        raw_attention_2d.shape[0],
+        grid.shape[1],
+        grid.shape[0],
         orig_w,
         orig_h,
         threshold,
