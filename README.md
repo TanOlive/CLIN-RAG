@@ -10,7 +10,7 @@
 
 ---
 
-## 📖 Project Overview
+## Project Overview
 
 CLIN-RAG is a state-of-the-art multimodal Retrieval-Augmented Generation (RAG) system designed for automated chest X-ray report generation. The system aims to bridge the "Semantic Gap" in medical imaging by employing a precedence-driven RAG architecture. 
 
@@ -29,10 +29,10 @@ By retrieving structurally and semantically similar historical cases to ground t
 graph TD
     A[Target Chest X-Ray] -->|Encode| B(MedSigLIP Vision Encoder)
     B -->|Query Vector| C[(FAISS Vector Database)]
+    B -->|Self-Attention Saliency| I[Vision Saliency Heatmap]
     C -->|Retrieve Top-k| D[Historical Cases Context]
     A --> E(MedGemma 1.5 4B Generator)
     D --> E
-    E -->|Final Layer Self-Attention| I[Vision Saliency Heatmap]
     E -->|Stream| F{Live Token Streaming}
     F -->|Parse| G[<clinical_reasoning> CoT Block]
     F -->|Parse| H[Clinical Report Markdown]
@@ -43,17 +43,17 @@ graph TD
 
 ---
 
-## ✨ Features
+## Features
 
 - **Precedence-Driven RAG:** Retrieves structurally similar historical cases to provide highly relevant medical context and ground the LLM's diagnosis.
 - **Clinical Chain of Thought (CoT):** Enforces internal reasoning prior to diagnosis generation, reducing hallucinations by requiring visual facts to be stated first.
-- **Explainable AI (XAI):** Extracts the final-layer self-attention maps directly from MedGemma's Vision Tower to visualize the model's structural focus and general visual saliency during image processing.
+- **Explainable AI (XAI):** Extracts the final-layer self-attention maps directly from the MedSigLIP Vision Encoder to visualize the model's structural focus and general visual saliency during image processing.
 - **Live Token Streaming:** Real-time UI rendering in Streamlit with on-the-fly Regex parsing of reasoning blocks and report sections.
 - **Ablation Evaluation Suite:** Automated offline evaluation calculating standard NLP metrics (ROUGE, BLEU, BERTScore) and domain-specific metrics (Clinical Recall).
 
 ---
 
-## 🚀 Installation & Setup
+## Installation & Setup
 
 1. **Clone the Repository**
    ```bash
@@ -78,7 +78,7 @@ graph TD
 
 ---
 
-## 💻 Usage Guide
+## Usage Guide
 
 ### Streamlit UI (Interactive Demo)
 To launch the interactive web interface, run:
@@ -98,7 +98,7 @@ python evaluation/evaluate_pipeline.py
 
 ---
 
-## 🗂️ Using Custom Datasets (Bring Your Own Data)
+## Using Custom Datasets (Bring Your Own Data)
 
 CLIN-RAG is designed to be easily adaptable to your own hospital's historical dataset. Follow these strict structural requirements to deploy CLIN-RAG with custom data:
 
