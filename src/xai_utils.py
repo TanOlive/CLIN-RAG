@@ -42,6 +42,7 @@ from src.encoder import ClinicalVisionEncoder
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
+from src import config
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -152,7 +153,7 @@ def generate_attention_heatmap(
     #   • activations <  threshold → fully transparent (alpha = 0)
     # A moderate base opacity lets the radiograph detail remain visible
     # even where the heatmap is active.
-    BASE_ALPHA: int = 140  # ~55 % opacity for active regions
+    BASE_ALPHA: int = config.XAI_BASE_ALPHA  # ~55 % opacity for active regions
 
     alpha: np.ndarray = np.where(
         heatmap_full >= threshold,
@@ -238,7 +239,7 @@ def process_vision_attention(
     # ------------------------------------------------------------------
     # Calculate the 98th percentile to ignore extreme isolated spikes
     if np.any(grid > 0):
-        v_max = np.percentile(grid, 98)
+        v_max = np.percentile(grid, config.XAI_PERCENTILE_CLIP)
         # Clip the values so the extreme artifact is flattened to v_max
         clipped_attention = np.clip(grid, 0, v_max)
         # Normalize based on the clipped maximum to stretch the anatomical features
@@ -259,7 +260,7 @@ def process_vision_attention(
     # 5. Apply Spatial Smoothing
     # ------------------------------------------------------------------
     # Calculate a dynamic kernel size (approx 7.5% of width)
-    k_size = max(3, int(orig_w * 0.075))
+    k_size = max(3, int(orig_w * config.XAI_SMOOTHING_KERNEL_RATIO))
     if k_size % 2 == 0:
         k_size += 1
         
@@ -275,7 +276,7 @@ def process_vision_attention(
     # ------------------------------------------------------------------
     # 7. Build the alpha channel with dynamic thresholding
     # ------------------------------------------------------------------
-    BASE_ALPHA: int = 140  # ~55 % opacity for active regions
+    BASE_ALPHA: int = config.XAI_BASE_ALPHA  # ~55 % opacity for active regions
 
     if threshold >= 1.0:
         alpha = np.zeros_like(heatmap_full, dtype=np.uint8)

@@ -4,6 +4,10 @@ import logging
 import pandas as pd
 from collections import Counter
 from pathlib import Path
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from src import config
 
 # Setup Logging
 logging.basicConfig(
@@ -12,25 +16,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-REPORTS_CSV = PROJECT_ROOT / "data" / "archive" / "indiana_reports.csv"
-OUTPUT_JSON = PROJECT_ROOT / "data" / "archive" / "indiana_reports_clinical_entities.json"
-
 # Basic anatomical terms to filter out if they stand alone
-STOP_WORDS = {
-    "normal", "lung", "lungs", "pleura", "heart", "mediastinum", 
-    "diaphragm", "bone", "bones", "spine", "rib", "ribs", 
-    "chest", "thoracic", "aorta", "cardiac silhouette",
-    "pulmonary", "soft tissue", "trachea", "clavicle", "scapula"
-}
+STOP_WORDS = config.ENTITIES_STOP_WORDS
 
 def extract_entities():
-    if not REPORTS_CSV.exists():
-        logger.error(f"Reports file not found at {REPORTS_CSV}")
+    if not config.REPORTS_CSV.exists():
+        logger.error(f"Reports file not found at {config.REPORTS_CSV}")
         return
 
-    logger.info(f"Loading reports from {REPORTS_CSV}")
-    df = pd.read_csv(REPORTS_CSV)
+    logger.info(f"Loading reports from {config.REPORTS_CSV}")
+    df = pd.read_csv(config.REPORTS_CSV)
 
     if "Problems" not in df.columns:
         logger.error("Column 'Problems' not found in dataset.")
@@ -54,17 +49,17 @@ def extract_entities():
                 
             entity_counter[clean_entity] += 1
 
-    # Select Top 50 most frequent
-    top_50 = [entity for entity, count in entity_counter.most_common(50)]
+    # Select Top N most frequent
+    top_50 = [entity for entity, count in entity_counter.most_common(config.ENTITIES_TOP_K)]
     
     logger.info(f"Extracted {len(top_50)} clinical entities. Top 5: {top_50[:5]}")
 
     # Save to JSON
-    OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_JSON, "w") as f:
+    config.ENTITIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(config.ENTITIES_PATH, "w") as f:
         json.dump(top_50, f, indent=4)
         
-    logger.info(f"Successfully saved clinical entities to {OUTPUT_JSON}")
+    logger.info(f"Successfully saved clinical entities to {config.ENTITIES_PATH}")
 
 if __name__ == "__main__":
     extract_entities()

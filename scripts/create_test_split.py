@@ -2,17 +2,17 @@ import os
 import shutil
 import pandas as pd
 from pathlib import Path
+import sys
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from src import config
 
 def main():
     # 1. Setup Paths
-    root_dir = Path(__file__).resolve().parent.parent
-    reports_path = root_dir / 'data' / 'archive' / 'indiana_reports.csv'
-    images_dir = root_dir / 'data' / 'archive' / 'images' / 'images_normalized'
-    target_dir = root_dir / 'data' / 'test_samples'
     
     # Create or clear target directory
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for f in target_dir.iterdir():
+    config.TEST_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    for f in config.TEST_IMAGES_DIR.iterdir():
         if f.is_file():
             try:
                 f.unlink()
@@ -21,15 +21,10 @@ def main():
     
     # 2. Stratified Sampling Logic
     print("Reading reports...")
-    df = pd.read_csv(reports_path)
+    df = pd.read_csv(config.REPORTS_CSV)
     
     # Pathological keywords to exclude from Normal
-    patho_keywords = [
-        'opacity', 'consolidation', 'infiltrate', 'atelectasis',
-        'cardiomegaly', 'enlarged heart', 'cardiac silhouette enlarged',
-        'effusion', 'pleural',
-        'fracture', 'emphysema', 'nodule', 'scarring'
-    ]
+    patho_keywords = config.TEST_SPLIT_PATHO_KEYWORDS
     
     def get_category(row):
         text = f"{str(row['findings'])} {str(row['impression'])}".lower()
@@ -50,14 +45,14 @@ def main():
     df['Category'] = df.apply(get_category, axis=1)
     
     # 3. Selection
-    categories = ["Normal", "Opacity_Consolidation", "Cardiomegaly", "Pleural_Effusion", "Other_Pathology"]
+    categories = config.TEST_SPLIT_CATEGORIES
     selected_uids = []
     
     print("Sampling categories...")
     for cat in categories:
         cat_df = df[df['Category'] == cat]
-        if len(cat_df) >= 5:
-            sampled = cat_df.sample(n=5, random_state=42)
+        if len(cat_df) >= config.TEST_SPLIT_SAMPLES_PER_CATEGORY:
+            sampled = cat_df.sample(n=config.TEST_SPLIT_SAMPLES_PER_CATEGORY, random_state=config.TEST_SPLIT_RANDOM_SEED)
         else:
             sampled = cat_df
         selected_uids.append(sampled)
@@ -77,7 +72,7 @@ def main():
         # Find all images for this UID
         # Based on file listing, images start with "UID_"
         prefix = f"{uid}_"
-        matched_images = list(images_dir.glob(f"{prefix}*.png"))
+        matched_images = list(config.IMAGES_DIR.glob(f"{prefix}*.png"))
         
         if not matched_images:
             # Maybe the images use a slightly different naming convention or don't exist
@@ -87,7 +82,7 @@ def main():
         for img_path in matched_images:
             original_filename = img_path.name
             new_filename = f"{category}_{original_filename}"
-            target_path = target_dir / new_filename
+            target_path = config.TEST_IMAGES_DIR / new_filename
             
             shutil.copy2(img_path, target_path)
             category_counts[category] += 1
@@ -104,8 +99,8 @@ def main():
 
     # Save metadata
     metadata_df = pd.DataFrame(metadata_records)
-    metadata_df.to_csv(target_dir / 'test_metadata.csv', index=False)
-    print(f"Test metadata saved to {target_dir / 'test_metadata.csv'} with {len(metadata_df)} image records.")
+    metadata_df.to_csv(config.TEST_METADATA_PATH, index=False)
+    print(f"Test metadata saved to {config.TEST_METADATA_PATH} with {len(metadata_df)} image records.")
     
     # 6. Console Output
     print("\n--- Summary of Copied Images ---")

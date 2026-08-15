@@ -47,25 +47,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.encoder import ClinicalVisionEncoder
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-#: Project root (parent of this script).
-PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
-
-#: Path to the projections metadata CSV.
-PROJECTIONS_CSV: Path = PROJECT_ROOT / "data" / "archive" / "indiana_projections.csv"
-
-#: Directory containing the normalised chest X-ray PNGs.
-IMAGES_DIR: Path = PROJECT_ROOT / "data" / "archive" / "images" / "images_normalized"
-
-#: Output path for the FAISS index file.
-INDEX_OUTPUT: Path = PROJECT_ROOT / "data" / "clinical_index.faiss"
-
-#: Output path for the FAISS-ID-to-metadata mapping.
-MAPPING_OUTPUT: Path = PROJECT_ROOT / "data" / "index_mapping.pkl"
+from src import config
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -82,7 +64,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 
-def load_projection_records(csv_path: Path = PROJECTIONS_CSV) -> pd.DataFrame:
+def load_projection_records(csv_path: Path = config.PROJECTIONS_CSV) -> pd.DataFrame:
     """Load the projections CSV and return a clean DataFrame.
 
     The CSV contains three columns: ``uid`` (int), ``filename`` (str),
@@ -114,7 +96,7 @@ def load_projection_records(csv_path: Path = PROJECTIONS_CSV) -> pd.DataFrame:
     df["uid"] = df["uid"].astype(int)
 
     # Exclude test cases if mapping exists
-    test_meta_path = PROJECT_ROOT / "data" / "test_samples" / "test_metadata.csv"
+    test_meta_path = config.TEST_METADATA_PATH
     if test_meta_path.exists():
         test_df = pd.read_csv(test_meta_path)
         test_uids = set(test_df["uid"].astype(int))
@@ -136,7 +118,7 @@ def load_projection_records(csv_path: Path = PROJECTIONS_CSV) -> pd.DataFrame:
 
 def validate_image_paths(
     df: pd.DataFrame,
-    images_dir: Path = IMAGES_DIR,
+    images_dir: Path = config.IMAGES_DIR,
 ) -> tuple[pd.DataFrame, int]:
     """Filter the projections DataFrame to rows whose image files exist.
 
@@ -183,7 +165,7 @@ def validate_image_paths(
 def encode_images_safe(
     encoder: ClinicalVisionEncoder,
     image_paths: List[str],
-    batch_size: int = 16,
+    batch_size: int = config.ENCODE_BATCH_SIZE,
 ) -> tuple[np.ndarray, List[int]]:
     """Encode images with graceful per-image error handling.
 
@@ -375,8 +357,8 @@ def build_index_mapping(
 def save_artifacts(
     index: faiss.IndexFlatIP,
     mapping: List[Dict[str, Any]],
-    index_path: Path = INDEX_OUTPUT,
-    mapping_path: Path = MAPPING_OUTPUT,
+    index_path: Path = config.INDEX_PATH,
+    mapping_path: Path = config.MAPPING_PATH,
 ) -> None:
     """Write the FAISS index and mapping to disk.
 
@@ -439,7 +421,7 @@ def main() -> None:
 
     # Build the ordered list of absolute image paths.
     image_paths: List[str] = [
-        str(IMAGES_DIR / fn) for fn in valid_df["filename"]
+        str(config.IMAGES_DIR / fn) for fn in valid_df["filename"]
     ]
 
     # ------------------------------------------------------------------
@@ -453,7 +435,7 @@ def main() -> None:
     embeddings, valid_indices = encode_images_safe(
         encoder,
         image_paths,
-        batch_size=16,
+        batch_size=config.ENCODE_BATCH_SIZE,
     )
 
     if embeddings.shape[0] == 0:
@@ -489,8 +471,8 @@ def main() -> None:
     print(f"  Successfully encoded     : {embeddings.shape[0]:,}")
     print(f"  Embedding dimension      : {embeddings.shape[1]}")
     print(f"  FAISS index vectors      : {index.ntotal:,}")
-    print(f"  Index file               : {INDEX_OUTPUT}")
-    print(f"  Mapping file             : {MAPPING_OUTPUT}")
+    print(f"  Index file               : {config.INDEX_PATH}")
+    print(f"  Mapping file             : {config.MAPPING_PATH}")
     print(f"  Wall time                : {int(minutes)}m {seconds:.1f}s")
     print("-" * 70)
     print("[OK] Indexing complete.")

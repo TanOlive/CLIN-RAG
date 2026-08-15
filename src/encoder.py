@@ -39,20 +39,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, SiglipModel
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-#: Hugging Face model identifier for MedSigLIP at 448 × 448 resolution.
-MODEL_ID: str = "google/medsiglip-448"
-
-#: Default location of the Hugging Face access token (project-local).
-_TOKEN_PATH: Path = Path(__file__).resolve().parent.parent / "data" / "Hugging_Face_Access_Token.txt"
-
-#: Directory containing the normalised Indiana University X-ray PNGs.
-_IMAGES_DIR: Path = (
-    Path(__file__).resolve().parent.parent / "data" / "archive" / "images" / "images_normalized"
-)
+from src import config
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,7 +56,7 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 
-def _read_hf_token(path: Path = _TOKEN_PATH) -> str:
+def _read_hf_token(path: Optional[Path] = None) -> str:
     """Read and return the Hugging Face access token from a local file.
 
     Parameters
@@ -90,6 +77,9 @@ def _read_hf_token(path: Path = _TOKEN_PATH) -> str:
     ValueError
         If the token file is empty or contains only whitespace.
     """
+    if path is None:
+        path = config.TOKEN_PATH
+
     if not path.exists():
         raise FileNotFoundError(
             f"Hugging Face token file not found at {path}. "
@@ -165,12 +155,15 @@ class ClinicalVisionEncoder:
 
     def __init__(
         self,
-        model_id: str = MODEL_ID,
+        model_id: Optional[str] = None,
         token_path: Optional[Path] = None,
         device: Optional[torch.device] = None,
     ) -> None:
+        if model_id is None:
+            model_id = config.ENCODER_MODEL_ID
+            
         # --- Token -----------------------------------------------------------
-        effective_path: Path = token_path if token_path is not None else _TOKEN_PATH
+        effective_path: Path = token_path if token_path is not None else config.TOKEN_PATH
         token: str = _read_hf_token(effective_path)
 
         # --- Device ----------------------------------------------------------
@@ -364,15 +357,15 @@ if __name__ == "__main__":
     encoder = ClinicalVisionEncoder()
 
     # Pick the first available image from the normalised directory.
-    sample_images: list[Path] = sorted(_IMAGES_DIR.glob("*.png"))
+    sample_images: list[Path] = sorted(config.IMAGES_DIR.glob("*.png"))
     if not sample_images:
-        print(f"[ERROR] No .png files found in {_IMAGES_DIR}")
+        print(f"[ERROR] No .png files found in {config.IMAGES_DIR}")
         sys.exit(1)
 
     test_path: str = str(sample_images[0])
     print(f"\nTest image : {test_path}")
     print(f"Device     : {encoder.device}")
-    print(f"Model      : {MODEL_ID}")
+    print(f"Model      : {config.ENCODER_MODEL_ID}")
 
     # --- Single image test ---------------------------------------------------
     embedding: np.ndarray = encoder.encode_image(test_path)

@@ -28,16 +28,13 @@ from PIL import Image
 
 from src.rag_pipeline import ClinicalRAGSystem
 from src.xai_utils import process_vision_attention
+from src import config
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parent
-# Pointing to the archive images to fetch reference images for display
-IMAGES_DIR: Path = PROJECT_ROOT / "data" / "archive" / "images" / "images_normalized"
-TEMP_UPLOAD_DIR: Path = PROJECT_ROOT / "temp_uploads"
-TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+config.TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Resource Management
@@ -83,7 +80,7 @@ def main() -> None:
         "Number of Reference Cases (k)",
         min_value=1,
         max_value=5,
-        value=3,
+        value=config.RETRIEVAL_K_CASES,
         help="The number of structurally similar historical cases to retrieve as context for the generator.",
         disabled=st.session_state["is_analyzing"]
     )
@@ -94,7 +91,7 @@ def main() -> None:
         "XAI Heatmap Focus",
         min_value=0.0,
         max_value=1.0,
-        value=0.50,
+        value=config.DEFAULT_HEATMAP_THRESHOLD,
         step=0.05,
         help="0.0 shows all activations. 1.0 hides the heatmap entirely. Use this to isolate high-attention (red) areas.",
         disabled=st.session_state["is_analyzing"]
@@ -184,7 +181,7 @@ def main() -> None:
             # We strictly avoid any image processing or filtering here.
             import uuid
             local_filename = f"{uuid.uuid4().hex}_{uploaded_file.name}"
-            tmp_path = TEMP_UPLOAD_DIR / local_filename
+            tmp_path = config.TEMP_UPLOAD_DIR / local_filename
             # Load and force RGB conversion to strip alpha/indexed channels
             img = Image.open(uploaded_file).convert("RGB")
             img.save(tmp_path)
@@ -235,7 +232,7 @@ def main() -> None:
 
                 if test_mode:
                     import pandas as pd
-                    TEST_METADATA_PATH = PROJECT_ROOT / "data" / "test_samples" / "test_metadata.csv"
+                    TEST_METADATA_PATH = config.TEST_METADATA_PATH
                     if TEST_METADATA_PATH.exists():
                         test_df = pd.read_csv(TEST_METADATA_PATH)
                         match = test_df[test_df["new_filename"] == uploaded_file.name]
@@ -314,7 +311,7 @@ def main() -> None:
                 for idx, case in enumerate(retrieved_cases):
                     with tabs[idx]:
                         # Fetch the actual historical image from the dataset
-                        ref_image_path = IMAGES_DIR / case["filename"]
+                        ref_image_path = config.IMAGES_DIR / case["filename"]
                         
                         ev_col_text, ev_col_img = st.columns([2, 1], gap="medium")
                         

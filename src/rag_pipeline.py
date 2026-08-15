@@ -29,17 +29,11 @@ from transformers import AutoModelForImageTextToText, AutoProcessor, TextIterato
 from threading import Thread
 
 from src.encoder import ClinicalVisionEncoder
+from src import config
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
-TOKEN_PATH: Path = PROJECT_ROOT / "data" / "Hugging_Face_Access_Token.txt"
-REPORTS_CSV: Path = PROJECT_ROOT / "data" / "archive" / "indiana_reports.csv"
-INDEX_PATH: Path = PROJECT_ROOT / "data" / "clinical_index.faiss"
-MAPPING_PATH: Path = PROJECT_ROOT / "data" / "index_mapping.pkl"
-IMAGES_DIR: Path = PROJECT_ROOT / "data" / "archive" / "images" / "images_normalized"
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -56,9 +50,9 @@ class ClinicalRAGSystem:
         logger.info("Initialising Clinical RAG System...")
 
         # 1. Load Hugging Face Authentication Token
-        if not TOKEN_PATH.exists():
-            raise FileNotFoundError(f"Missing HF token file at {TOKEN_PATH}")
-        self.hf_token: str = TOKEN_PATH.read_text().strip()
+        if not config.TOKEN_PATH.exists():
+            raise FileNotFoundError(f"Missing HF token file at {config.TOKEN_PATH}")
+        self.hf_token: str = config.TOKEN_PATH.read_text().strip()
 
         # 2. Determine Optimal Device
         if torch.cuda.is_available():
@@ -73,7 +67,7 @@ class ClinicalRAGSystem:
         self.encoder = ClinicalVisionEncoder()
 
         # 4. Load the FAISS Index and Mapping
-        if not INDEX_PATH.exists() or not MAPPING_PATH.exists():
+        if not config.INDEX_PATH.exists() or not config.MAPPING_PATH.exists():
             raise FileNotFoundError(
                 "FAISS index or mapping file missing. Please run build_index.py first."
             )
@@ -81,25 +75,25 @@ class ClinicalRAGSystem:
         import shutil
         import os
         tmp_read_path = "temp_clinical_index_read.faiss"
-        shutil.copy2(str(INDEX_PATH), tmp_read_path)
+        shutil.copy2(str(config.INDEX_PATH), tmp_read_path)
         self.index: faiss.IndexFlatIP = faiss.read_index(tmp_read_path)
         os.remove(tmp_read_path)
-        with open(MAPPING_PATH, "rb") as f:
+        with open(config.MAPPING_PATH, "rb") as f:
             self.mapping: List[Dict[str, Any]] = pickle.load(f)
         logger.info("Loaded FAISS index with %d vectors.", self.index.ntotal)
 
         # 5. Load Clinical Reports
-        if not REPORTS_CSV.exists():
-            raise FileNotFoundError(f"Missing reports file at {REPORTS_CSV}")
+        if not config.REPORTS_CSV.exists():
+            raise FileNotFoundError(f"Missing reports file at {config.REPORTS_CSV}")
         # Note: uid is kept exactly as read (no string manipulation or hyphen splits)
-        self.reports_df: pd.DataFrame = pd.read_csv(REPORTS_CSV)
+        self.reports_df: pd.DataFrame = pd.read_csv(config.REPORTS_CSV)
         # Ensure uid is an integer for exact matching
         self.reports_df["uid"] = pd.to_numeric(self.reports_df["uid"], errors="coerce")
         logger.info("Loaded %d clinical reports.", len(self.reports_df))
 
         # 6. Load MedGemma Generator Model
         # Using bfloat16 to fit the 4B parameter model efficiently on GPU VRAM.
-        model_id = "google/medgemma-1.5-4b-it"
+        model_id = config.GENERATOR_MODEL_ID
         logger.info("Loading generator model '%s' ...", model_id)
         
         # Track active threads to prevent OOMs from aborted Streamlit runs
@@ -113,7 +107,7 @@ class ClinicalRAGSystem:
             model_id, token=self.hf_token
         )
         self.generator = AutoModelForImageTextToText.from_pretrained(
-            "google/medgemma-1.5-4b-it",
+            config.GENERATOR_MODEL_ID,
             device_map=self.device,
             dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
             token=self.hf_token,
@@ -123,7 +117,7 @@ class ClinicalRAGSystem:
         logger.info("MedGemma generator loaded successfully.")
 
     def retrieve_similar_cases(
-        self, image_path: str | Path, k: int = 3
+        self, image_path: str | Path, k: int = config.RETRIEVAL_K_CASES
     ) -> List[Dict[str, Any]]:
         """Encode the target image and retrieve top-k similar historical cases.
 
@@ -381,10 +375,14 @@ class ClinicalRAGSystem:
         with torch.no_grad():
             generation_kwargs = dict(
                 **model_inputs,
-                max_new_tokens=512,
-                do_sample=False,  # Greedy decoding for clinical factual consistency
+                max_new_tokens=config.GENERATION_MAX_NEW_TOKENS,
+                do_sample=config.GENERATION_DO_SAMPLE,
                 streamer=streamer,
             )
+
+            if config.GENERATION_DO_SAMPLE:
+                generation_kwargs["temperature"] = config.GENERATION_TEMPERATURE
+                generation_kwargs["top_p"] = config.GENERATION_TOP_P
 
             thread = Thread(target=self.generator.generate, kwargs=generation_kwargs)
             self.active_generation_thread = thread
@@ -446,7 +444,7 @@ if __name__ == "__main__":
 
         # Pick a sample image to test the full pipeline
         # (Assuming the images directory is populated based on Step 1)
-        test_images = list(IMAGES_DIR.glob("*.png"))
+        test_images = list(config.IMAGES_DIR.glob("*.png"))
         if not test_images:
             print("No test images found in data/archive/images/images_normalized/")
         else:

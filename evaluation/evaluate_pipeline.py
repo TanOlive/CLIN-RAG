@@ -30,17 +30,18 @@ logger = logging.getLogger(__name__)
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from src.rag_pipeline import ClinicalRAGSystem, PROJECT_ROOT
+from src.rag_pipeline import ClinicalRAGSystem
+from src import config
 
 class ClinicalEvaluator:
     def __init__(self, debug: bool = False):
         self.debug = debug
         self.system = ClinicalRAGSystem()
-        self.test_metadata_path = PROJECT_ROOT / "data" / "test_samples" / "test_metadata.csv"
-        self.images_dir = PROJECT_ROOT / "data" / "test_samples"
+        self.test_metadata_path = config.TEST_METADATA_PATH
+        self.images_dir = config.TEST_IMAGES_DIR
         
         # Load clinical entities dynamically
-        entities_path = PROJECT_ROOT / "data" / "archive" / "indiana_reports_clinical_entities.json"
+        entities_path = config.ENTITIES_PATH
         if not entities_path.exists():
             logger.error(f"Clinical entities JSON not found at {entities_path}")
             raise FileNotFoundError("Please run `python extract_clinical_entities.py` first to generate the entities file.")
@@ -51,7 +52,7 @@ class ClinicalEvaluator:
         
         # Setup Output Directories
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = PROJECT_ROOT / "evaluation_runs" / f"run_{timestamp}"
+        self.run_dir = config.EVALUATION_RUNS_DIR / f"run_{timestamp}"
         self.data_dir = self.run_dir / "data"
         self.plots_dir = self.run_dir / "plots"
         
@@ -62,7 +63,7 @@ class ClinicalEvaluator:
         logger.info("Initializing offline NLP evaluation metrics...")
         self.rouge_scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
         self.bleu_smoother = SmoothingFunction().method1
-        self.bertscore_model = "allenai/scibert_scivocab_uncased"
+        self.bertscore_model = config.BERTSCORE_MODEL_ID
         
         # Disable overly verbose BERTScore logging
         logging.getLogger("transformers").setLevel(logging.WARNING)
@@ -74,9 +75,9 @@ class ClinicalEvaluator:
             "num_samples": num_samples,
             "debug_mode": self.debug,
             "bertscore_model": self.bertscore_model,
-            "model_name": "google/medgemma-1.5-4b-it",
-            "generation_max_new_tokens": 512,
-            "generation_do_sample": False,
+            "model_name": config.GENERATOR_MODEL_ID,
+            "generation_max_new_tokens": config.MAX_NEW_TOKENS,
+            "generation_do_sample": config.DO_SAMPLE,
             "generation_device": str(self.system.device),
         }
         with open(self.data_dir / "metadata.json", "w") as f:
@@ -250,8 +251,8 @@ class ClinicalEvaluator:
             
         test_df = pd.read_csv(self.test_metadata_path)
         if self.debug:
-            test_df = test_df.head(10)
-            logger.info("DEBUG MODE: Only processing 10 samples.")
+            test_df = test_df.head(config.DEBUG_SAMPLE_LIMIT)
+            logger.info(f"DEBUG MODE: Only processing {config.DEBUG_SAMPLE_LIMIT} samples.")
             
         results = []
         baseline_preds = []
@@ -269,7 +270,7 @@ class ClinicalEvaluator:
             
             try:
                 # Retrieve RAG cases
-                cases = self.system.retrieve_similar_cases(img_path, k=3)
+                cases = self.system.retrieve_similar_cases(img_path, k=config.RETRIEVAL_K_CASES)
                 
                 # Baseline (Zero-Shot) - empty cases list
                 logger.info("Generating Baseline report (No RAG)...")
@@ -349,7 +350,7 @@ class ClinicalEvaluator:
         import transformers
         _orig_from_pretrained = transformers.AutoTokenizer.from_pretrained
         def _patched_from_pretrained(*args, **kwargs):
-            kwargs['model_max_length'] = 512
+            kwargs['model_max_length'] = config.BERTSCORE_MODEL_MAX_LENGTH
             kwargs['use_fast'] = False
             return _orig_from_pretrained(*args, **kwargs)
         transformers.AutoTokenizer.from_pretrained = _patched_from_pretrained

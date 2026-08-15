@@ -1,0 +1,83 @@
+paths:
+  data_dir: "data"
+  token_path: "data/Hugging_Face_Access_Token.txt"
+  reports_csv: "data/archive/indiana_reports.csv"
+  projections_csv: "data/archive/indiana_projections.csv"
+  index_path: "data/clinical_index.faiss"
+  mapping_path: "data/index_mapping.pkl"
+  images_dir: "data/archive/images/images_normalized"
+  entities_path: "data/archive/indiana_reports_clinical_entities.json"
+  test_metadata_path: "data/test_samples/test_metadata.csv"
+  test_images_dir: "data/test_samples"
+  evaluation_runs_dir: "evaluation_runs"
+  temp_upload_dir: "temp_uploads"
+
+models:
+  generator_id: "google/medgemma-1.5-4b-it"
+  encoder_id: "google/medsiglip-448"
+  bertscore_id: "allenai/scibert_scivocab_uncased"
+
+hyperparameters:
+  retrieval_k_cases: 3
+  generation_max_new_tokens: 512
+  generation_do_sample: false
+  generation_temperature: 0.0
+  generation_top_p: 1.0
+
+evaluation:
+  bertscore_model_max_length: 512
+  debug_sample_limit: 2
+
+data_processing:
+  encode_batch_size: 16
+  entities_top_k: 50
+  entities_stop_words:
+    - "normal"
+    - "lung"
+    - "lungs"
+    - "pleura"
+    - "heart"
+    - "mediastinum"
+    - "diaphragm"
+    - "bone"
+    - "bones"
+    - "spine"
+    - "rib"
+    - "ribs"
+    - "chest"
+    - "thoracic"
+    - "aorta"
+    - "cardiac silhouette"
+    - "pulmonary"
+    - "soft tissue"
+    - "trachea"
+    - "clavicle"
+    - "scapula"
+  test_split_samples_per_category: 11
+  test_split_random_seed: 42
+  test_split_categories:
+    - "Normal"
+    - "Opacity_Consolidation"
+    - "Cardiomegaly"
+    - "Pleural_Effusion"
+    - "Other_Pathology"
+  test_split_patho_keywords:
+    - "opacity"
+    - "consolidation"
+    - "infiltrate"
+    - "atelectasis"
+    - "cardiomegaly"
+    - "enlarged heart"
+    - "cardiac silhouette enlarged"
+    - "effusion"
+    - "pleural"
+    - "fracture"
+    - "emphysema"
+    - "nodule"
+    - "scarring"
+
+ui:
+  default_heatmap_threshold: 0.50
+  xai_base_alpha: 140
+  xai_smoothing_kernel_ratio: 0.075
+  xai_percentile_clip: 98
