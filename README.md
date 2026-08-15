@@ -23,7 +23,7 @@ By retrieving structurally and semantically similar historical cases to ground t
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph TD
