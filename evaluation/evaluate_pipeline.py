@@ -136,7 +136,7 @@ class ClinicalEvaluator:
         # 1. Boxplots for ROUGE, BLEU, and BERTScore (Baseline vs RAG)
         plt.figure(figsize=(12, 6))
         # We need to reshape the dataframe to have 'Metric', 'Score', and 'Model'
-        metrics_bases = ["rouge1", "rouge2", "rougeL", "bleu", "bertscore_f1", "clinical_recall"]
+        metrics_bases = ["rouge1", "rouge2", "rougeL", "bleu", "bertscore_f1"]
         
         plot_data = []
         for index, row in df.iterrows():
@@ -217,6 +217,29 @@ class ClinicalEvaluator:
             plt.close()
         except Exception as e:
             logger.warning(f"Could not generate radar chart: {e}")
+
+        # 4. Dedicated Plot for Clinical Recall
+        plt.figure(figsize=(8, 6))
+        recall_data = []
+        for index, row in df.iterrows():
+            if "baseline_clinical_recall" in row and pd.notna(row["baseline_clinical_recall"]):
+                recall_data.append({"Score": row["baseline_clinical_recall"], "Model": "Baseline"})
+            if "rag_clinical_recall" in row and pd.notna(row["rag_clinical_recall"]):
+                recall_data.append({"Score": row["rag_clinical_recall"], "Model": "RAG"})
+                
+        recall_df = pd.DataFrame(recall_data)
+        if not recall_df.empty:
+            # Create boxplot
+            sns.boxplot(x="Model", y="Score", data=recall_df, palette="Set2", showfliers=False)
+            # Overlay with stripplot to show individual data points (handles overlapping 1.0s perfectly)
+            sns.stripplot(x="Model", y="Score", data=recall_df, color=".25", alpha=0.6, jitter=True)
+            
+            plt.title("Clinical Recall Distribution (Baseline vs RAG)")
+            plt.ylim(-0.05, 1.05)
+            plt.ylabel("Clinical Recall Score")
+            plt.tight_layout()
+            plt.savefig(self.plots_dir / "clinical_recall_boxplot.png", dpi=300)
+        plt.close()
 
     def run_evaluation(self):
         logger.info("Starting Quantitative Evaluation Pipeline (Ablation Study)...")
