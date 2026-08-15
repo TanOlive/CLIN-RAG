@@ -47,11 +47,11 @@ from transformers import AutoProcessor, SiglipModel
 MODEL_ID: str = "google/medsiglip-448"
 
 #: Default location of the Hugging Face access token (project-local).
-_TOKEN_PATH: Path = Path(__file__).resolve().parent / "data" / "Hugging_Face_Access_Token.txt"
+_TOKEN_PATH: Path = Path(__file__).resolve().parent.parent / "data" / "Hugging_Face_Access_Token.txt"
 
 #: Directory containing the normalised Indiana University X-ray PNGs.
 _IMAGES_DIR: Path = (
-    Path(__file__).resolve().parent / "data" / "archive" / "images" / "images_normalized"
+    Path(__file__).resolve().parent.parent / "data" / "archive" / "images" / "images_normalized"
 )
 
 # ---------------------------------------------------------------------------

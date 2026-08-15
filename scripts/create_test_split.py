@@ -5,7 +5,7 @@ from pathlib import Path
 
 def main():
     # 1. Setup Paths
-    root_dir = Path(__file__).resolve().parent
+    root_dir = Path(__file__).resolve().parent.parent
     reports_path = root_dir / 'data' / 'archive' / 'indiana_reports.csv'
     images_dir = root_dir / 'data' / 'archive' / 'images' / 'images_normalized'
     target_dir = root_dir / 'data' / 'test_samples'

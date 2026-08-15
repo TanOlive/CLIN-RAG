@@ -25,15 +25,16 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, TextIteratorStreamer
+from threading import Thread
 
-from encoder import ClinicalVisionEncoder
+from src.encoder import ClinicalVisionEncoder
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT: Path = Path(__file__).resolve().parent
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 TOKEN_PATH: Path = PROJECT_ROOT / "data" / "Hugging_Face_Access_Token.txt"
 REPORTS_CSV: Path = PROJECT_ROOT / "data" / "archive" / "indiana_reports.csv"
 INDEX_PATH: Path = PROJECT_ROOT / "data" / "clinical_index.faiss"
@@ -101,10 +102,10 @@ class ClinicalRAGSystem:
         model_id = "google/medgemma-1.5-4b-it"
         logger.info("Loading generator model '%s' ...", model_id)
         
-        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-        
-        # 6. Load the Generator Model (MedGemma)
-        logger.info("Loading generator model 'google/medgemma-1.5-4b-it' ...")
+        # Track active threads to prevent OOMs from aborted Streamlit runs
+        import threading
+        self.active_generation_thread = None
+        self.generation_lock = threading.Lock()
         
         # We explicitly set attn_implementation="eager" because the PyTorch SDPA 'math' 
         # fallback is extremely slow on some Windows setups during autoregressive generation.
@@ -114,7 +115,7 @@ class ClinicalRAGSystem:
         self.generator = AutoModelForImageTextToText.from_pretrained(
             "google/medgemma-1.5-4b-it",
             device_map=self.device,
-            torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
+            dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
             token=self.hf_token,
             attn_implementation="eager",
         )
@@ -140,9 +141,10 @@ class ClinicalRAGSystem:
         """
         logger.info("Retrieving top-%d similar cases for image: %s", k, image_path)
 
-        # Encode image (encoder STRICTLY preserves raw data integrity; no blurring)
-        query_vector: np.ndarray = self.encoder.encode_image(str(image_path))
-        query_vector = query_vector[np.newaxis, :]  # Expand to shape (1, D)
+        with self.generation_lock:
+            # Encode image (encoder STRICTLY preserves raw data integrity; no blurring)
+            query_vector: np.ndarray = self.encoder.encode_image(str(image_path))
+            query_vector = query_vector[np.newaxis, :]  # Expand to shape (1, D)
 
         # Query FAISS Index
         scores, indices = self.index.search(query_vector, k)
@@ -235,30 +237,22 @@ class ClinicalRAGSystem:
     # Report generation
     # ------------------------------------------------------------------
 
-    def generate_report(
+    def generate_report_stream(
         self, target_image_path: str | Path, retrieved_cases: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Generate a structured clinical report using MedGemma and RAG context.
+    ):
+        """Generator that streams the MedGemma report chunk by chunk."""
+        # Wait for any previous background thread to finish BEFORE doing any PyTorch ops
+        if getattr(self, "active_generation_thread", None) is not None and self.active_generation_thread.is_alive():
+            logger.warning("Found an existing generation thread still running! Joining it before starting a new one to prevent CUDA OOM...")
+            self.active_generation_thread.join()
+            
+            # Force cleanup of the previous thread's memory before allocating for the new one
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        Parameters
-        ----------
-        target_image_path : str | Path
-            Path to the target chest X-ray image.
-        retrieved_cases : List[Dict[str, Any]]
-            The context dictionary list returned by ``retrieve_similar_cases``.
-
-        Returns
-        -------
-        Dict[str, Any]
-            Dictionary containing:
-            - ``retrieved_cases`` – the input cases (pass-through).
-            - ``generated_report`` – the Markdown-formatted report text.
-            - ``attention_map_2d`` – a 2-D ``np.ndarray`` (or *None*) of
-              aggregated self-attention from generated tokens to image
-              tokens, suitable for XAI heatmap visualisation.
-            - ``num_image_tokens`` – count of image placeholder tokens.
-        """
-        logger.info("Constructing prompt and generating report...")
+        with self.generation_lock:
+            logger.info("Constructing prompt and generating report...")
 
         # Load raw image for the generator (no destructive preprocessing)
         path = Path(target_image_path)
@@ -278,35 +272,45 @@ class ClinicalRAGSystem:
         context_str = "\n\n".join(context_blocks)
 
         # Construct Prompt enforcing structured output
-        prompt_text = (
-            f"""You are a highly precise, deterministic clinical reporting AI. 
-            Your sole task is to generate a structured chest X-ray report based EXACTLY and ONLY on the provided Historical Context.
-            
-            STRICT RULES:
-            1. NO DISCLAIMERS: Never output warnings like "I am an AI", "Please note", or "Requires a medical professional".
-            2. NO HALLUCINATIONS: Do not mention anatomical structures (e.g., "osseous structures", "bones") unless they are explicitly present in the provided historical context.
-            3. FORMAT: Always use exactly the two markdown headers "### FINDINGS:" and "### IMPRESSION:".
-            
-            [EXAMPLE - NORMAL CASE]
-            Context Findings: The cardiac silhouette and mediastinum size are within normal limits. There is no pulmonary edema. There is no focal consolidation. There are no XXXX of a pleural effusion. There is no evidence of pneumothorax.
-            Context Impression: Normal chest x-XXXX.
-            
-            Output:
-            ### FINDINGS:
-            The cardiac silhouette and mediastinum size are within normal limits. There is no pulmonary edema, focal consolidation, pleural effusion, or pneumothorax.
-            
-            ### IMPRESSION:
-            Normal chest.
-            [END EXAMPLE]
-            
-            Now, generate the report for the current case following these strict rules.
-            
-            HISTORICAL CONTEXT:
-            {context_str}
-            
-            Output:
-            """
-        )
+        if not retrieved_cases:
+            prompt_text = (
+                "You are an expert clinical AI. You are provided with a target chest X-ray.\n\n"
+                "CRITICAL INSTRUCTION - REASONING FIRST:\n"
+                "1. VISUAL PRIMACY: Your diagnosis must rely EXCLUSIVELY on what you see in the image.\n"
+                "2. DO NOT output the report directly. You MUST analyze the image step-by-step first.\n\n"
+                "MANDATORY PROTOCOL:\n"
+                "You MUST output your internal reasoning inside <clinical_reasoning> tags BEFORE generating the report.\n\n"
+                "Output Format:\n"
+                "<clinical_reasoning>\n"
+                "1. Visual Perception: [Detail exactly what you observe in the current image]\n"
+                "2. Synthesis: [Conclude your diagnosis based on visual facts]\n"
+                "</clinical_reasoning>\n\n"
+                "### FINDINGS:\n"
+                "[Synthesize findings here]\n\n"
+                "### IMPRESSION:\n"
+                "[Synthesize impression here]\n"
+            )
+        else:
+            prompt_text = (
+                "You are an expert clinical AI. You are provided with a target chest X-ray and historical reports from visually similar precedent cases.\n\n"
+                "CRITICAL INSTRUCTION - THE OMISSION RULE:\n"
+                "1. The historical cases are for medical reference only. \n"
+                "2. VISUAL PRIMACY: Your final diagnosis must rely EXCLUSIVELY on what you see in the current image.\n"
+                "3. NEGATIVE DISTRACTION AVOIDANCE: If the historical cases mention a pathology (e.g., 'granuloma', 'tube') that is NOT visible in the current image, DO NOT mention it. DO NOT state that it is missing. Simply ignore it.\n"
+                "4. Do not adopt highly specific measurements from the historical text unless you can visually verify them.\n\n"
+                f"<historical_context>\n{context_str}\n</historical_context>\n\n"
+                "MANDATORY PROTOCOL:\n"
+                "You MUST output your internal reasoning inside <clinical_reasoning> tags BEFORE generating the report.\n\n"
+                "Output Format:\n"
+                "<clinical_reasoning>\n"
+                "1. Visual Perception: [Detail exactly what you observe in the current image]\n"
+                "2. Synthesis: [Conclude your diagnosis based on visual facts, ignoring irrelevant historical context]\n"
+                "</clinical_reasoning>\n\n"
+                "### FINDINGS:\n"
+                "[Synthesize findings here]\n\n"
+                "### IMPRESSION:\n"
+                "[Synthesize impression here]\n"
+            )
 
         # MedGemma / PaliGemma formatting: usually expects <image> token prepended or
         # specific chat formatting. Using the processor's chat template if available,
@@ -368,55 +372,62 @@ class ClinicalRAGSystem:
                     vision_attention = vision_outputs.attentions[-1].to(torch.float32).cpu().numpy()
 
         # -----------------------------------------------------------------
-        # Generate Report
+        # Generate Report with Streaming
         # -----------------------------------------------------------------
-        logger.info("Running MedGemma generate...")
+        logger.info("Running MedGemma generate with streaming...")
+
+        streamer = TextIteratorStreamer(self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True)
 
         with torch.no_grad():
-            outputs = self.generator.generate(
+            generation_kwargs = dict(
                 **model_inputs,
                 max_new_tokens=512,
                 do_sample=False,  # Greedy decoding for clinical factual consistency
-                return_dict_in_generate=True,
+                streamer=streamer,
             )
 
-        # -----------------------------------------------------------------
-        # Decode the generated report and Individual Tokens
-        # -----------------------------------------------------------------
-        input_len = model_inputs["input_ids"].shape[1]
-        output_ids = outputs.sequences
-        generated_token_ids = output_ids[0][input_len:]
-        
-        # Cleanly decode tokens for UI presentation
-        generated_tokens = []
-        for tid in generated_token_ids:
-            # Decode single token ID
-            decoded_str = self.processor.decode([tid], skip_special_tokens=True)
-            # Remove SentencePiece underscore meta characters if present
-            decoded_str = decoded_str.replace(' ', ' ')
-            generated_tokens.append(decoded_str)
+            thread = Thread(target=self.generator.generate, kwargs=generation_kwargs)
+            self.active_generation_thread = thread
+            thread.start()
 
-        generated_text = self.processor.decode(
-            generated_token_ids, skip_special_tokens=True
-        ).strip()
-
-        # Aggressively free the massive attention tensors
-        del outputs
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                for new_text in streamer:
+                    yield {"status": "streaming", "text": new_text}
+                thread.join()
+            finally:
+                # If the generator is interrupted (e.g. Streamlit rerun), we must free references
+                del model_inputs
+                del generation_kwargs
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         logger.info("Report generation completed successfully.")
 
-        # -----------------------------------------------------------------
-        # Return Results
-        # -----------------------------------------------------------------
-        return {
+        yield {
+            "status": "complete",
             "retrieved_cases": retrieved_cases,
-            "generated_report": generated_text,
-            "generated_tokens": generated_tokens,
             "vision_attention": vision_attention,
             "num_image_tokens": num_image_tokens,
+        }
+
+    def generate_report(
+        self, target_image_path: str | Path, retrieved_cases: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper for generate_report_stream for backwards compatibility."""
+        full_text = ""
+        final_data = {}
+        for chunk in self.generate_report_stream(target_image_path, retrieved_cases):
+            if chunk["status"] == "streaming":
+                full_text += chunk["text"]
+            elif chunk["status"] == "complete":
+                final_data = chunk
+                
+        return {
+            "generated_report": full_text.strip(),
+            "retrieved_cases": final_data.get("retrieved_cases", []),
+            "vision_attention": final_data.get("vision_attention"),
+            "num_image_tokens": final_data.get("num_image_tokens", 0),
         }
 
 

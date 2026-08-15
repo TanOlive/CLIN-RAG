@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from encoder import ClinicalVisionEncoder
+from src.encoder import ClinicalVisionEncoder
 
 # ---------------------------------------------------------------------------
 # Logging

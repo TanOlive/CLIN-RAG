@@ -43,14 +43,17 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from encoder import ClinicalVisionEncoder
+import sys
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from src.encoder import ClinicalVisionEncoder
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 #: Project root (parent of this script).
-PROJECT_ROOT: Path = Path(__file__).resolve().parent
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 
 #: Path to the projections metadata CSV.
 PROJECTIONS_CSV: Path = PROJECT_ROOT / "data" / "archive" / "indiana_projections.csv"

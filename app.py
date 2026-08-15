@@ -18,6 +18,7 @@ Created: 2026-08-03
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -25,8 +26,8 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
-from rag_pipeline import ClinicalRAGSystem
-from xai_utils import process_vision_attention
+from src.rag_pipeline import ClinicalRAGSystem
+from src.xai_utils import process_vision_attention
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -43,7 +44,7 @@ TEMP_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 
-@st.cache_resource(show_spinner="Loading Clinical RAG Models & Vector DB into VRAM...")
+@st.cache_resource(show_spinner="Loading Clinical RAG Models & Vector DB into VRAM...", max_entries=1)
 def load_system() -> ClinicalRAGSystem:
     """Instantiate and cache the ClinicalRAGSystem globally.
     
@@ -60,6 +61,9 @@ def load_system() -> ClinicalRAGSystem:
 
 
 def main() -> None:
+    if "is_analyzing" not in st.session_state:
+        st.session_state["is_analyzing"] = False
+
     # 1. Page Configuration
     st.set_page_config(
         page_title="CLIN-RAG: Clinical Evidence Retrieval",
@@ -80,7 +84,8 @@ def main() -> None:
         min_value=1,
         max_value=5,
         value=3,
-        help="The number of structurally similar historical cases to retrieve as context for the generator."
+        help="The number of structurally similar historical cases to retrieve as context for the generator.",
+        disabled=st.session_state["is_analyzing"]
     )
 
     st.sidebar.markdown("---")
@@ -92,7 +97,11 @@ def main() -> None:
         value=0.50,
         step=0.05,
         help="0.0 shows all activations. 1.0 hides the heatmap entirely. Use this to isolate high-attention (red) areas.",
+        disabled=st.session_state["is_analyzing"]
     )
+
+    st.sidebar.markdown("---")
+    test_mode = st.sidebar.checkbox("Enable Test Mode (Ground Truth)", value=False, help="If a test sample is uploaded, this will display the original ground truth report at the bottom of the page.", disabled=st.session_state["is_analyzing"])
 
     # 3. Initialize Pipeline
     try:
@@ -117,6 +126,7 @@ def main() -> None:
             "Upload a Chest X-ray image",
             type=["png", "jpg", "jpeg"],
             help="The image must not have any destructive preprocessing applied.",
+            disabled=st.session_state["is_analyzing"]
         )
 
     if uploaded_file is not None:
@@ -141,6 +151,9 @@ def main() -> None:
                 "generated_report",
                 "retrieved_cases",
                 "selected_token_idx",
+                "gt_findings",
+                "gt_impression",
+                "clinical_reasoning",
             ]:
                 st.session_state.pop(key, None)
             st.session_state["_xai_source_file"] = current_file_name
@@ -150,29 +163,91 @@ def main() -> None:
         # 5. Execution Logic
         col_btn, _ = st.columns([1, 4])
         with col_btn:
-            generate_clicked = st.button("Generate Clinical Report", type="primary")
+            if not st.session_state["is_analyzing"]:
+                if st.button("Generate Clinical Report", type="primary", disabled=uploaded_file is None):
+                    st.session_state["is_analyzing"] = True
+                    # Purge old results to force a fresh generation
+                    for key in ["generated_report", "clinical_reasoning", "xai_vision_attention", "retrieved_cases"]:
+                        st.session_state.pop(key, None)
+                    st.rerun()
+            else:
+                if st.button("🛑 Start Over / Cancel", type="primary"):
+                    st.session_state["is_analyzing"] = False
+                    # Purge results to reset the UI
+                    for key in ["generated_report", "clinical_reasoning", "xai_vision_attention", "retrieved_cases"]:
+                        st.session_state.pop(key, None)
+                    st.rerun()
 
-        if generate_clicked:
+        if st.session_state["is_analyzing"] and "generated_report" not in st.session_state:
             # We must write the uploaded file temporarily to disk because 
             # rag_sys.retrieve_similar_cases expects a file path.
             # We strictly avoid any image processing or filtering here.
-            local_filename = uploaded_file.name
+            import uuid
+            local_filename = f"{uuid.uuid4().hex}_{uploaded_file.name}"
             tmp_path = TEMP_UPLOAD_DIR / local_filename
             # Load and force RGB conversion to strip alpha/indexed channels
             img = Image.open(uploaded_file).convert("RGB")
             img.save(tmp_path)
 
             try:
-                with st.spinner("Retrieving historical cases and generating report..."):
-                    # Execute RAG Pipeline
+                with st.spinner("Retrieving historical cases..."):
                     retrieved_cases: List[Dict[str, Any]] = rag_sys.retrieve_similar_cases(str(tmp_path), k=k_cases)
-                    result: Dict[str, Any] = rag_sys.generate_report(str(tmp_path), retrieved_cases)
 
-                # Cache results in session_state for slider reactivity
-                st.session_state["generated_report"] = result["generated_report"]
-                st.session_state["generated_tokens"] = result.get("generated_tokens", [])
-                st.session_state["retrieved_cases"] = retrieved_cases
-                st.session_state["xai_vision_attention"] = result.get("vision_attention")
+                reasoning_expander = st.expander("🧠 Live AI Clinical Chain of Thought", expanded=True)
+                reasoning_placeholder = reasoning_expander.empty()
+
+                full_text = ""
+                reasoning_text = ""
+                report_text = ""
+                
+                with st.spinner("Model is generating report..."):
+                    for chunk in rag_sys.generate_report_stream(str(tmp_path), retrieved_cases):
+                        if chunk["status"] == "streaming":
+                            full_text += chunk["text"]
+                            
+                            # Parse reasoning block dynamically
+                            reasoning_match = re.search(r"<clinical_reasoning>(.*?)(?:</clinical_reasoning>|$)", full_text, re.DOTALL)
+                            if reasoning_match:
+                                reasoning_text = reasoning_match.group(1).strip()
+                                reasoning_placeholder.info(reasoning_text + " ▌")
+                                
+                                # If reasoning block has closed, remove the cursor
+                                report_split = full_text.split("</clinical_reasoning>")
+                                if len(report_split) > 1:
+                                    reasoning_placeholder.info(reasoning_text)
+                                
+                        elif chunk["status"] == "complete":
+                            # Finalize
+                            if reasoning_text:
+                                reasoning_placeholder.info(reasoning_text)
+                            
+                            report_split = full_text.split("</clinical_reasoning>")
+                            if len(report_split) > 1:
+                                report_text = report_split[1].strip()
+                            else:
+                                report_text = full_text.strip()
+                                
+                            # Cache data for the XAI Heatmap and UI refreshes
+                            st.session_state["clinical_reasoning"] = reasoning_text
+                            st.session_state["generated_report"] = report_text
+                            st.session_state["xai_vision_attention"] = chunk["vision_attention"]
+                            st.session_state["retrieved_cases"] = chunk["retrieved_cases"]
+
+                if test_mode:
+                    import pandas as pd
+                    TEST_METADATA_PATH = PROJECT_ROOT / "data" / "test_samples" / "test_metadata.csv"
+                    if TEST_METADATA_PATH.exists():
+                        test_df = pd.read_csv(TEST_METADATA_PATH)
+                        match = test_df[test_df["new_filename"] == uploaded_file.name]
+                        if not match.empty:
+                            st.session_state["gt_findings"] = str(match.iloc[0]["findings"])
+                            st.session_state["gt_impression"] = str(match.iloc[0]["impression"])
+                        else:
+                            st.session_state["gt_findings"] = None
+                            st.session_state["gt_impression"] = None
+
+                st.session_state["is_analyzing"] = False
+                st.rerun()
 
             except Exception as e:
                 st.error(f"An error occurred during pipeline execution: {e}")
@@ -181,8 +256,13 @@ def main() -> None:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
+        if "clinical_reasoning" in st.session_state:
+            with st.expander("🧠 View AI Clinical Chain of Thought (Reasoning Process)", expanded=False):
+                st.info("This is the internal cognitive process of the AI before formulating the final diagnostic report.")
+                st.markdown(st.session_state["clinical_reasoning"])
+
         # ---------------------------------------------------------------
-        # Display Target Image & Heatmap (Now it sees the updated state!)
+        # Display Target Image & Heatmap
         # ---------------------------------------------------------------
         with target_col:
             st.subheader("Target Image & XAI Heatmap")
@@ -208,11 +288,12 @@ def main() -> None:
             else:
                 st.image(target_image, width='stretch', caption="Uploaded Radiograph")
 
+
         # ---------------------------------------------------------------
         # Display cached results (persists across slider re-runs)
         # ---------------------------------------------------------------
         if "generated_report" in st.session_state:
-
+            
             # ------ Generated Report ------
             st.subheader("2. AI-Generated Clinical Report")
             st.info("The following report was generated by MedGemma (4B) using the retrieved historical context.", icon="🤖")
@@ -256,6 +337,17 @@ def main() -> None:
             else:
                 st.warning("No similar cases were retrieved.")
 
+            # ------ Ground Truth ------
+            if test_mode and st.session_state.get("gt_findings") is not None:
+                st.markdown("---")
+                st.subheader("4. Ground Truth (Test Mode)")
+                st.info("The actual, human-written radiological report from the dataset for this specific test image.", icon="🎯")
+                
+                st.markdown("#### Actual Findings")
+                st.warning(st.session_state["gt_findings"], icon="🔬")
+                
+                st.markdown("#### Actual Impression")
+                st.success(st.session_state["gt_impression"], icon="📝")
 
 if __name__ == "__main__":
     main()
