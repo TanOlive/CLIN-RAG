@@ -5,10 +5,6 @@
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-orange)](https://huggingface.co/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-%23FE4B4B.svg?style=flat&logo=streamlit&logoColor=white)](https://streamlit.io/)
 
-**Subtitle:** Master's Thesis Project by **Oliver Tano Schlichting** (HAW Hamburg)  
-**Thesis Title:** *Example-Based Explainability in Clinical Vision-Language Models: A Precedence-Driven Retrieval-Augmented Generation Approach*
-
----
 
 ## Project Overview
 

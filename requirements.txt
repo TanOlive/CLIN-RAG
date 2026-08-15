@@ -1,0 +1,25 @@
+# Core ML & Vision
+torch>=2.0.0
+torchvision
+transformers>=5.10.0
+huggingface_hub>=1.20.0
+
+# Vector DB & Retrieval
+faiss-cpu>=1.14.0
+
+# UI & Frontend
+streamlit>=1.50.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+PyYAML>=6.0.0
+
+# NLP Evaluation
+rouge_score>=0.1.2
+bert-score>=0.3.13
+nltk>=3.10.0
+
+# Visualization
+matplotlib>=3.10.0
+seaborn>=0.13.0
