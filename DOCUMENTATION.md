@@ -1,9 +1,4 @@
 # CLIN-RAG: Clinical Evidence Retrieval and Grounded Report Generation
-## Technical System Documentation & Architecture Reference
-
-This document provides a comprehensive, deeply technical, and mathematically exact documentation of the **CLIN-RAG** codebase. It is designed to serve as the definitive factual reference for academic publications and thesis preparation in IEEE format. Every workflow, parameter, class, function, tensor dimension, and design constraint described herein is verified directly against the underlying Python source code, YAML configuration, and evaluation modules.
-
----
 
 ## Table of Contents
 1. [System Architecture & Workflow](#1-system-architecture--workflow)
